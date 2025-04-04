@@ -1,100 +1,107 @@
+use std::{collections::HashMap, thread, time::Duration};
+use sysinfo::{Pid, ProcessStatus, System};
 use chrono::Local;
-use std::{env, thread, time::Duration};
-use sysinfo::{ProcessStatus, System};
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    let mut continuous = false;
-    let mut interval = 3;
-    let mut show_header = true;
-
-    // Simple argument parsing
-    for (i, arg) in args.iter().enumerate() {
-        if arg == "--continuous" || arg == "-c" {
-            continuous = true;
-            if i + 1 < args.len() {
-                if let Ok(seconds) = args[i + 1].parse::<u64>() {
-                    interval = seconds;
-                }
-            }
-        }
-        if arg == "--no-header" || arg == "-n" {
-            show_header = false;
-        }
-    }
-
+    // Initialize the system information gatherer
     let mut system = System::new_all();
+    
+    // Store previous process list to detect new and terminated processes
+    let mut previous_processes: HashMap<Pid, String> = HashMap::new();
+    
+    println!("Real-time process monitor (Press Ctrl+C to exit)");
+    println!("Watching for process changes...");
 
     loop {
-        // Clear screen in continuous mode
-        if continuous {
-            print!("\x1B[2J\x1B[1;1H"); // ANSI escape code to clear screen
+        // Refresh the process list
+        system.refresh_processes();
+        
+        // Get current process list
+        let current_processes: HashMap<Pid, String> = system.processes()
+            .iter()
+            .map(|(pid, process)| (*pid, process.name().to_string()))
+            .collect();
+        
+        // Check for new processes
+        let mut new_processes = Vec::new();
+        for (pid, name) in &current_processes {
+            if !previous_processes.contains_key(pid) {
+                new_processes.push((*pid, name.clone()));
+            }
         }
-
-        system.refresh_all();
-
-        if show_header {
-            println!(
-                "{:<8} {:<10} {:<8} {:<10} {:<15} {:<20}",
-                "PID", "CPU%", "MEM (MB)", "STATE", "TIME", "COMMAND"
-            );
-            println!("{:-<80}", "");
+        
+        // Check for terminated processes
+        let mut terminated_processes = Vec::new();
+        for (pid, name) in &previous_processes {
+            if !current_processes.contains_key(pid) {
+                terminated_processes.push((*pid, name.clone()));
+            }
         }
-
-        // Get all processes and sort by PID
-        let mut processes: Vec<_> = system.processes().iter().collect();
-        processes.sort_by_key(|&(pid, _)| pid);
-
-        for (&pid, process) in processes {
-            // Format process state
-            let state = match process.status() {
-                ProcessStatus::Run => "Running",
-                ProcessStatus::Idle => "Idle",
-                ProcessStatus::Sleep => "Sleep",
-                ProcessStatus::Stop => "Stopped",
-                ProcessStatus::Zombie => "Zombie",
-                ProcessStatus::Tracing => "Tracing",
-                ProcessStatus::Dead => "Dead",
-                ProcessStatus::Wakekill => "Wakekill",
-                ProcessStatus::Waking => "Waking",
-                ProcessStatus::LockBlocked => "Locked",
-                ProcessStatus::Unknown(_) => "Unknown",
-                _ => "Other",
-            };
-
-            // Format memory usage in MB
-            let memory_mb = process.memory() as f64 / 1024.0 / 1024.0;
-
-            // Just use the current time for display
-            let current_time = Local::now().format("%H:%M:%S").to_string();
-
-            // Get command with arguments
-            let cmd = process.cmd().join(" ");
-            let display_cmd = if cmd.is_empty() {
-                process.name().to_string()
-            } else {
-                cmd
-            };
-
-            println!(
-                "{:<8} {:<10.1} {:<10.1} {:<15} {:<15} {:.20}",
-                pid,
-                process.cpu_usage(),
-                memory_mb,
-                state,
-                current_time,
-                display_cmd
-            );
+        
+        // Display process changes if any occurred
+        if !new_processes.is_empty() || !terminated_processes.is_empty() {
+            let timestamp = Local::now().format("%H:%M:%S").to_string();
+            
+            // Clear screen for better readability
+            print!("\x1B[2J\x1B[1;1H");
+            
+            println!("Process changes detected at {}", timestamp);
+            println!("{:-<50}", "");
+            
+            // Show new processes with details
+            if !new_processes.is_empty() {
+                println!("\nNEW PROCESSES:");
+                println!("{:<10} {:<10} {:<10} {:<15} {:<20}", 
+                    "PID", "CPU%", "MEM (MB)", "STATE", "COMMAND");
+                println!("{:-<65}", "");
+                
+                for (pid, _) in new_processes {
+                    if let Some(process) = system.process(pid) {
+                        // Format process state
+                        let state = match process.status() {
+                            ProcessStatus::Run => "Running",
+                            ProcessStatus::Sleep => "Sleep",
+                            ProcessStatus::Idle => "Idle",
+                            ProcessStatus::Stop => "Stopped",
+                            ProcessStatus::Zombie => "Zombie",
+                            _ => "Other",
+                        };
+                        
+                        // Format memory usage in MB
+                        let memory_mb = process.memory() as f64 / 1024.0 / 1024.0;
+                        
+                        // Display process info with fixed width columns
+                        println!(
+                            "{:<10} {:<10.1} {:<10.1} {:<15} {:<20}",
+                            pid,
+                            process.cpu_usage(),
+                            memory_mb,
+                            state,
+                            process.name()
+                        );
+                    }
+                }
+            }
+            
+            // Show terminated processes
+            if !terminated_processes.is_empty() {
+                println!("\nTERMINATED PROCESSES:");
+                println!("{:<10} {:<20}", "PID", "NAME");
+                println!("{:-<30}", "");
+                
+                for (pid, name) in terminated_processes {
+                    println!("{:<10} {:<20}", pid, name);
+                }
+            }
+            
+            // Show current process count
+            println!("\nTotal processes: {}", current_processes.len());
         }
-
-        if !continuous {
-            break;
-        }
-
-        println!(
-            "\nRefreshing every {} seconds. Press Ctrl+C to exit.",
-            interval
-        );
-        thread::sleep(Duration::from_secs(interval));
+        
+        // Update previous process list for next iteration
+        previous_processes = current_processes;
+        
+        // Brief sleep to reduce CPU usage
+        thread::sleep(Duration::from_millis(500));
     }
 }
