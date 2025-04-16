@@ -1,4 +1,4 @@
-use std::io::{stdout, Write};
+use std::io::{stdout, Write, stdin};
 use std::{thread, time::Duration};
 use crossterm::{
     cursor,
@@ -6,6 +6,7 @@ use crossterm::{
     terminal::{self, ClearType},
     style::Print,
     ExecutableCommand,
+    event::{self, Event, KeyCode}
 };
 use sysinfo::{System, ProcessStatus, Pid};
 use users::get_user_by_uid;
@@ -72,7 +73,32 @@ fn main() {
                 pid, username, cpu, mem, state, command_display
             ).unwrap();
         }
+      
+        if event::poll(Duration::from_millis(10)).unwrap(){
+            if let Event::Key(key_event) = event::read().unwrap() {
+                if key_event.code == KeyCode::Char('k') {
+                  terminal::disable_raw_mode().unwrap();
+                  print!("Enter the PID of the process you want to kill: ");
+                  stdout().flush().unwrap();
 
+                  let mut input = String::new();
+                  stdin().read_line(&mut input).unwrap();
+
+                  let pid: i32 = input.trim().parse().unwrap();
+                  if let Some(process) = system.process(Pid::from(pid)) {
+                    if process.kill() {
+                      println!("Process of PID {} has been killed.", pid);
+                    }
+                    else {
+                      println!("Oops, this process has not been killed :(");
+                    }
+                    system.refresh_processes();
+                  }
+                  terminal::enable_raw_mode().unwrap();
+                }
+            }
+        }
+      
         stdout.flush().unwrap();
         thread::sleep(Duration::from_millis(500));
     }
