@@ -1,5 +1,5 @@
 use std::{thread, time::Duration};
-use std::io::{stdout, Write, stdin};
+use std::io::{stdout, Write};
 use std::process::Command;
 use sysinfo::{System, ProcessStatus, Pid};
 use users::get_user_by_uid;
@@ -7,17 +7,28 @@ use termion::event::Key;
 use termion::input::TermRead;
 use termion::raw::IntoRawMode;
 use termion::{cursor, clear};
-use termion::async_stdin;
 use signal_hook::consts::signal::SIGINT;
 use signal_hook::flag;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+// Import the pause_resume module
+mod pause_resume;
+use pause_resume::{ProcessController, ProcessAction};
 
 // Enum to track current sort mode
 enum SortMode {
     Cpu,
     Memory,
     Pid,
+}
+
+// Enum to track current input mode
+enum InputMode {
+    Normal,
+    Search,
+    Kill,
+    Pause,  // New mode for pausing processes
 }
 
 fn main() {
@@ -40,15 +51,17 @@ fn main() {
     let medium_usage_color = "\x1B[38;5;220m"; // Yellow for medium usage
     let user_color = "\x1B[38;5;147m"; // Light purple for username
     let help_color = "\x1B[38;5;33m"; // Blue for help text
+    let paused_color = "\x1B[38;5;208m"; // Orange for paused processes
     
     // Application state
     let mut sort_mode = SortMode::Cpu;
-    let mut search_mode = false;
+    let mut input_mode = InputMode::Normal;
     let mut search_query = String::new();
-    let mut search_results: Vec<Pid> = Vec::new();
     let mut quit = false;
-    let mut kill_mode = false;
-    let mut kill_pid_input = String::new();
+    let mut pid_input = String::new();
+    
+    // Process controller for tracking paused processes
+    let mut process_controller = ProcessController::new();
     
     // Clear screen and hide cursor
     write!(stdout, "{}{}", clear::All, cursor::Hide).unwrap();
@@ -120,12 +133,13 @@ fn main() {
         };
         
         // Filter processes if in search mode
-        let display_processes = if search_mode && !search_query.is_empty() {
-            processes.iter()
-                .filter(|p| p.pid().to_string().contains(&search_query))
-                .collect::<Vec<_>>()
-        } else {
-            processes.iter().collect()
+        let display_processes = match input_mode {
+            InputMode::Search if !search_query.is_empty() => {
+                processes.iter()
+                    .filter(|p| p.pid().to_string().contains(&search_query))
+                    .collect::<Vec<_>>()
+            },
+            _ => processes.iter().collect()
         };
         
         // Calculate how many processes we can show
@@ -137,7 +151,10 @@ fn main() {
             let cpu = process.cpu_usage();
             let mem = (process.memory() as f64 / system.total_memory() as f64) * 100.0;
             
-            let state = match process.status() {
+            // Check if this process is paused by our app
+            let is_paused = process_controller.is_paused(&pid);
+            
+            let mut state = match process.status() {
                 ProcessStatus::Run => "Running",
                 ProcessStatus::Sleep => "Sleep",
                 ProcessStatus::Idle => "Idle",
@@ -146,14 +163,23 @@ fn main() {
                 _ => "Other",
             };
             
+            // Override display if process is paused by our application
+            if is_paused {
+                state = "Paused";
+            }
+            
             // Color for state
-            let state_color = match process.status() {
-                ProcessStatus::Run => running_color,
-                ProcessStatus::Sleep => sleep_color,
-                ProcessStatus::Idle => idle_color,
-                ProcessStatus::Stop => stopped_color,
-                ProcessStatus::Zombie => zombie_color,
-                _ => reset,
+            let state_color = if is_paused {
+                paused_color
+            } else {
+                match process.status() {
+                    ProcessStatus::Run => running_color,
+                    ProcessStatus::Sleep => sleep_color,
+                    ProcessStatus::Idle => idle_color,
+                    ProcessStatus::Stop => stopped_color,
+                    ProcessStatus::Zombie => zombie_color,
+                    _ => reset,
+                }
             };
             
             // Color for CPU based on usage
@@ -213,19 +239,27 @@ fn main() {
         ).unwrap();
         
         let num_cores = system.physical_core_count().unwrap_or(1);
-        write!(stdout, "{}{}CPUs: {} cores, Processes: {}{}\r\n", 
-            separator_color, bold, num_cores, display_processes.len(), reset
+        let paused_count = process_controller.get_paused_processes().len();
+        write!(stdout, "{}{}CPUs: {} cores, Processes: {}, Paused: {}{}\r\n", 
+            separator_color, bold, num_cores, display_processes.len(), paused_count, reset
         ).unwrap();
         
         // Help line at bottom
         write!(stdout, "{}{}", help_color, bold).unwrap();
-        if search_mode {
-            write!(stdout, "Search PID: {} | Enter when Done | Esc to cancel", search_query).unwrap();
-        } else if kill_mode {
-            write!(stdout, "Kill PID: {} | Enter to confirm | Esc to cancel", kill_pid_input).unwrap();
-        } else {
-            // Updated key mappings in help text
-            write!(stdout, "q:Quit | c:Sort CPU | m:Sort Mem | p:Sort PID | s:Search | k:Kill").unwrap();
+        match input_mode {
+            InputMode::Search => {
+                write!(stdout, "Search PID: {} | Enter when Done | Esc to cancel", search_query).unwrap();
+            },
+            InputMode::Kill => {
+                write!(stdout, "Kill PID: {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
+            },
+            InputMode::Pause => {
+                write!(stdout, "Enter PID to pause/resume: {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
+            },
+            InputMode::Normal => {
+                // Updated key mappings in help text including pause/resume
+                write!(stdout, "q:Quit | c:CPU | m:Mem | p:PID | s:Search | k:Kill | z:Pause/Resume").unwrap();
+            }
         }
         write!(stdout, "{}", reset).unwrap();
         
@@ -234,88 +268,133 @@ fn main() {
         
         // Handle input (non-blocking)
         if let Some(Ok(key)) = input.next() {
-            if search_mode {
-                match key {
-                    Key::Esc => {
-                        search_mode = false;
-                        search_query.clear();
-                    },
-                    Key::Char('\n') => {
-                        search_mode = false;
-                    },
-                    Key::Char(c) if c.is_digit(10) => {
-                        search_query.push(c);
-                    },
-                    Key::Backspace => {
-                        search_query.pop();
-                    },
-                    _ => {}
-                }
-            } else if kill_mode {
-                match key {
-                    Key::Esc => {
-                        kill_mode = false;
-                        kill_pid_input.clear();
-                    },
-                    Key::Char('\n') => {
-                        if !kill_pid_input.is_empty() {
-                            if let Ok(pid) = kill_pid_input.parse::<i32>() {
-                                let result = Command::new("kill")
-                                    .arg(pid.to_string())
-                                    .output();
-                                if result.is_err() {
-                                    // Just clear screen and continue instead of adding text
-                                    // which could cause duplication
+            match input_mode {
+                InputMode::Search => {
+                    match key {
+                        Key::Esc => {
+                            input_mode = InputMode::Normal;
+                            search_query.clear();
+                        },
+                        Key::Char('\n') => {
+                            input_mode = InputMode::Normal;
+                        },
+                        Key::Char(c) if c.is_digit(10) => {
+                            search_query.push(c);
+                        },
+                        Key::Backspace => {
+                            search_query.pop();
+                        },
+                        _ => {}
+                    }
+                },
+                InputMode::Kill => {
+                    match key {
+                        Key::Esc => {
+                            input_mode = InputMode::Normal;
+                            pid_input.clear();
+                        },
+                        Key::Char('\n') => {
+                            if !pid_input.is_empty() {
+                                if let Ok(pid) = pid_input.parse::<i32>() {
+                                    let _ = Command::new("kill")
+                                        .arg(pid.to_string())
+                                        .output();
                                 }
                             }
-                        }
-                        kill_mode = false;
-                        kill_pid_input.clear();
-                    },
-                    Key::Char(c) if c.is_digit(10) => {
-                        kill_pid_input.push(c);
-                    },
-                    Key::Backspace => {
-                        kill_pid_input.pop();
-                    },
-                    _ => {}
-                }
-            } else {
-                match key {
-                    // New key mappings
-                    Key::Char('q') => quit = true,
-                    Key::Char('c') => sort_mode = SortMode::Cpu,
-                    Key::Char('m') => sort_mode = SortMode::Memory,
-                    Key::Char('p') => sort_mode = SortMode::Pid,
-                    Key::Char('s') => {
-                        search_mode = true;
-                        search_query.clear();
-                    },
-                    Key::Char('k') => {
-                        kill_mode = true;
-                        kill_pid_input.clear();
-                    },
-                    // Keep F-key mappings as well for backward compatibility
-                    Key::F(1) => quit = true,
-                    Key::F(2) => sort_mode = SortMode::Cpu,
-                    Key::F(3) => sort_mode = SortMode::Memory,
-                    Key::F(4) => sort_mode = SortMode::Pid,
-                    Key::F(5) => {
-                        search_mode = true;
-                        search_query.clear();
-                    },
-                    Key::F(9) => {
-                        kill_mode = true;
-                        kill_pid_input.clear();
-                    },
-                    _ => {}
+                            input_mode = InputMode::Normal;
+                            pid_input.clear();
+                        },
+                        Key::Char(c) if c.is_digit(10) => {
+                            pid_input.push(c);
+                        },
+                        Key::Backspace => {
+                            pid_input.pop();
+                        },
+                        _ => {}
+                    }
+                },
+                InputMode::Pause => {
+                    match key {
+                        Key::Esc => {
+                            input_mode = InputMode::Normal;
+                            pid_input.clear();
+                        },
+                        Key::Char('\n') => {
+                            if !pid_input.is_empty() {
+                                if let Ok(pid_val) = pid_input.parse::<u32>() {
+                                    // Cast to usize when creating Pid (fixed from original code)
+                                    let pid = Pid::from(pid_val as usize);
+                                    
+                                    // Check if process is already paused
+                                    if process_controller.is_paused(&pid) {
+                                        // Process is paused, so resume it
+                                        let _ = process_controller.control_process(pid, ProcessAction::Resume);
+                                    } else {
+                                        // Process is not paused, so pause it
+                                        let _ = process_controller.control_process(pid, ProcessAction::Pause);
+                                    }
+                                }
+                            }
+                            input_mode = InputMode::Normal;
+                            pid_input.clear();
+                        },
+                        Key::Char(c) if c.is_digit(10) => {
+                            pid_input.push(c);
+                        },
+                        Key::Backspace => {
+                            pid_input.pop();
+                        },
+                        _ => {}
+                    }
+                },
+                InputMode::Normal => {
+                    match key {
+                        // Normal key mappings
+                        Key::Char('q') => quit = true,
+                        Key::Char('c') => sort_mode = SortMode::Cpu,
+                        Key::Char('m') => sort_mode = SortMode::Memory,
+                        Key::Char('p') => sort_mode = SortMode::Pid,
+                        Key::Char('s') => {
+                            input_mode = InputMode::Search;
+                            search_query.clear();
+                        },
+                        Key::Char('k') => {
+                            input_mode = InputMode::Kill;
+                            pid_input.clear();
+                        },
+                        Key::Char('z') => {
+                            input_mode = InputMode::Pause;
+                            pid_input.clear();
+                        },
+                        // Keep F-key mappings as well for backward compatibility
+                        Key::F(1) => quit = true,
+                        Key::F(2) => sort_mode = SortMode::Cpu,
+                        Key::F(3) => sort_mode = SortMode::Memory,
+                        Key::F(4) => sort_mode = SortMode::Pid,
+                        Key::F(5) => {
+                            input_mode = InputMode::Search;
+                            search_query.clear();
+                        },
+                        Key::F(9) => {
+                            input_mode = InputMode::Kill;
+                            pid_input.clear();
+                        },
+                        Key::F(10) => {
+                            input_mode = InputMode::Pause;
+                            pid_input.clear();
+                        },
+                        _ => {}
+                    }
                 }
             }
         }
         
         // Use a shorter sleep duration for more responsive updates
-        thread::sleep(Duration::from_millis(300)); // Even shorter for better responsiveness
+        thread::sleep(Duration::from_millis(500)); // Even shorter for better responsiveness
     }
+    
+    // Use the resume_all method to resume all paused processes before exiting
+    process_controller.resume_all();
     
     // Clean up terminal
     write!(stdout, "{}{}", cursor::Show, clear::All).unwrap();
