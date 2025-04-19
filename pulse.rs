@@ -11,6 +11,8 @@ use signal_hook::consts::signal::SIGINT;
 use signal_hook::flag;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+mod restart;
+use restart::{ProcessRestarter, RestartResult};
 
 // Import the pause_resume module
 mod pause_resume;
@@ -29,6 +31,7 @@ enum InputMode {
     Search,
     Kill,
     Pause,  // New mode for pausing processes
+    Restart,  // New mode for restarting processes
 }
 
 fn main() {
@@ -52,6 +55,7 @@ fn main() {
     let user_color = "\x1B[38;5;147m"; // Light purple for username
     let help_color = "\x1B[38;5;33m"; // Blue for help text
     let paused_color = "\x1B[38;5;208m"; // Orange for paused processes
+    let restart_color = "\x1B[38;5;183m"; // Light purple for restart text
     
     // Application state
     let mut sort_mode = SortMode::Cpu;
@@ -59,6 +63,9 @@ fn main() {
     let mut search_query = String::new();
     let mut quit = false;
     let mut pid_input = String::new();
+    let mut process_restarter = ProcessRestarter::new();
+    let mut status_message = String::new();
+    let mut status_timer = 0;
     
     // Process controller for tracking paused processes
     let mut process_controller = ProcessController::new();
@@ -240,9 +247,17 @@ fn main() {
         
         let num_cores = system.physical_core_count().unwrap_or(1);
         let paused_count = process_controller.get_paused_processes().len();
-        write!(stdout, "{}{}CPUs: {} cores, Processes: {}, Paused: {}{}\r\n", 
+        write!(stdout, "{}{}CPUs: {} cores, Processes: {}, Paused: {}{}", 
             separator_color, bold, num_cores, display_processes.len(), paused_count, reset
         ).unwrap();
+        
+        // Display status message if timer is active
+        if status_timer > 0 {
+            write!(stdout, " | {}{}{}", restart_color, status_message, reset).unwrap();
+            status_timer -= 1;
+        }
+        
+        write!(stdout, "\r\n").unwrap();
         
         // Help line at bottom
         write!(stdout, "{}{}", help_color, bold).unwrap();
@@ -256,9 +271,12 @@ fn main() {
             InputMode::Pause => {
                 write!(stdout, "Enter PID to pause/resume: {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
             },
+            InputMode::Restart => {
+                write!(stdout, "Enter PID to restart: {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
+            },
             InputMode::Normal => {
-                // Updated key mappings in help text including pause/resume
-                write!(stdout, "q:Quit | c:CPU | m:Mem | p:PID | s:Search | k:Kill | z:Pause/Resume").unwrap();
+                // Updated key mappings in help text including restart
+                write!(stdout, "q:Quit | c:CPU | m:Mem | p:PID | s:Search | k:Kill | z:Pause/Resume | r:Restart").unwrap();
             }
         }
         write!(stdout, "{}", reset).unwrap();
@@ -347,6 +365,44 @@ fn main() {
                         _ => {}
                     }
                 },
+                InputMode::Restart => {
+                    match key {
+                        Key::Esc => {
+                            input_mode = InputMode::Normal;
+                            pid_input.clear();
+                        },
+                        Key::Char('\n') => {
+                            if !pid_input.is_empty() {
+                                if let Ok(pid_val) = pid_input.parse::<u32>() {
+                                    // Create Pid from user input
+                                    let pid = Pid::from(pid_val as usize);
+                                    
+                                    // Attempt to restart the process
+                                    let result = process_restarter.restart_process(pid);
+                                    
+                                    // Set status message based on result
+                                    status_message = match result {
+                                        RestartResult::Success => format!("Process {} restart initiated", pid_val),
+                                        RestartResult::KillFailed => format!("Failed to kill process {}", pid_val),
+                                        RestartResult::NotFound => format!("Process {} not found", pid_val),
+                                    };
+                                    
+                                    // Set timer to display message for a few cycles
+                                    status_timer = 6; // Display for 3 seconds (6 * 500ms)
+                                }
+                            }
+                            input_mode = InputMode::Normal;
+                            pid_input.clear();
+                        },
+                        Key::Char(c) if c.is_digit(10) => {
+                            pid_input.push(c);
+                        },
+                        Key::Backspace => {
+                            pid_input.pop();
+                        },
+                        _ => {}
+                    }
+                },
                 InputMode::Normal => {
                     match key {
                         // Normal key mappings
@@ -366,6 +422,10 @@ fn main() {
                             input_mode = InputMode::Pause;
                             pid_input.clear();
                         },
+                        Key::Char('r') => {
+                            input_mode = InputMode::Restart;
+                            pid_input.clear();
+                        },
                         // Keep F-key mappings as well for backward compatibility
                         Key::F(1) => quit = true,
                         Key::F(2) => sort_mode = SortMode::Cpu,
@@ -381,6 +441,10 @@ fn main() {
                         },
                         Key::F(10) => {
                             input_mode = InputMode::Pause;
+                            pid_input.clear();
+                        },
+                        Key::F(11) => {
+                            input_mode = InputMode::Restart;
                             pid_input.clear();
                         },
                         _ => {}
