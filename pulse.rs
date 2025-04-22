@@ -1,3 +1,8 @@
+//Toqa:
+//at this point the pulse process manager outputs the priority but its always the default value 0; 
+//not sure if implementation problem or the os is not giving us the option to view it
+
+
 use std::{thread, time::Duration};
 use std::io::{stdout, Write};
 use std::process::Command;
@@ -12,7 +17,15 @@ use signal_hook::flag;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 mod restart;
+mod priority;
+// use priority::set_priority;
 use restart::{ProcessRestarter, RestartResult};
+use std::fs;
+// use std::io::{stdout, Write};
+// use termion::raw::IntoRawMode;
+use libc::{getpriority, PRIO_PROCESS};
+// use std::os::unix::process::PidExt; // For pid.as_raw()
+
 
 // Import the pause_resume module
 mod pause_resume;
@@ -32,6 +45,18 @@ enum InputMode {
     Kill,
     Pause,  // New mode for pausing processes
     Restart,  // New mode for restarting processes
+    Priority,
+}
+
+fn prompt_password() -> String {
+    // Use rpassword which handles all the terminal mode complexity
+    match rpassword::prompt_password("Enter admin password: ") {
+        Ok(password) => password,
+        Err(_) => {
+            eprintln!("Failed to read password");
+            String::new() // Return empty string on error
+        }
+    }
 }
 
 fn main() {
@@ -56,6 +81,10 @@ fn main() {
     let help_color = "\x1B[38;5;33m"; // Blue for help text
     let paused_color = "\x1B[38;5;208m"; // Orange for paused processes
     let restart_color = "\x1B[38;5;183m"; // Light purple for restart text
+    let fg_color = "\x1B[38;5;201m"; // bright pink for FG
+    let bg_color = "\x1B[38;5;39m";  // bright light blue for BG
+    
+
     
     // Application state
     let mut sort_mode = SortMode::Cpu;
@@ -66,6 +95,7 @@ fn main() {
     let mut process_restarter = ProcessRestarter::new();
     let mut status_message = String::new();
     let mut status_timer = 0;
+
     
     // Process controller for tracking paused processes
     let mut process_controller = ProcessController::new();
@@ -101,9 +131,10 @@ fn main() {
         ).unwrap();
         
         // Column headers with padding to ensure alignment
-        write!(stdout, "{:<6} {:<15} {:>6} {:>6} {:<10} {:<30}\r\n", 
-            "PID", "USER", "CPU%", "MEM%", "STATE", "COMMAND"
+        write!(stdout, "{:<6}  {:<15}  {:>6}  {:>6}  {:<6}  {:<6}  {:<10}  {:<30}\r\n", 
+            "PID", "USER", "CPU%", "MEM%", "PRIO", "FG/BG", "STATE", "COMMAND"
         ).unwrap();
+    
         
         // Separator line
         write!(stdout, "{}{}\r\n", 
@@ -116,7 +147,6 @@ fn main() {
         // Process list - collect as references to avoid ownership issues
         let mut processes: Vec<_> = system.processes().values().collect();
         
-        // FIXED SORTING LOGIC: Use explicit comparisons instead of negative keys
         match sort_mode {
             SortMode::Cpu => {
                 processes.sort_by(|a, b| {
@@ -127,14 +157,46 @@ fn main() {
             },
             SortMode::Memory => {
                 processes.sort_by(|a, b| {
+                    // First compare by memory usage (higher memory first)
                     let b_mem = b.memory();
                     let a_mem = a.memory();
-                    b_mem.cmp(&a_mem)
+                    
+                    // If memory usage is significantly different, sort by that
+                    if b_mem > a_mem + 1000000 || a_mem > b_mem + 1000000 {
+                        b_mem.cmp(&a_mem)
+                    } 
+                    // If memory usage is similar, prioritize active processes
+                    else {
+                        // Consider process state, with running processes first
+                        let a_running = a.status() == ProcessStatus::Run;
+                        let b_running = b.status() == ProcessStatus::Run;
+                        
+                        match (a_running, b_running) {
+                            // Both running or both not running - sort by memory
+                            (true, true) | (false, false) => b_mem.cmp(&a_mem),
+                            // a is running, b is not - a comes first
+                            (true, false) => std::cmp::Ordering::Less,
+                            // b is running, a is not - b comes first
+                            (false, true) => std::cmp::Ordering::Greater,
+                        }
+                    }
                 });
             },
             SortMode::Pid => {
+                // First sort all processes by PID
+                processes.sort_by(|a, b| a.pid().cmp(&b.pid()));
+                
+                // Then prioritize active processes (those with non-zero CPU usage)
+                // This keeps the PID ordering but brings active processes to the top
                 processes.sort_by(|a, b| {
-                    a.pid().cmp(&b.pid())
+                    let a_active = a.cpu_usage() > 0.1;
+                    let b_active = b.cpu_usage() > 0.1;
+                    
+                    match (a_active, b_active) {
+                        (true, false) => std::cmp::Ordering::Less,
+                        (false, true) => std::cmp::Ordering::Greater,
+                        _ => a.pid().cmp(&b.pid()) // Both active or both inactive, maintain PID order
+                    }
                 });
             },
         };
@@ -157,6 +219,27 @@ fn main() {
             let pid: Pid = process.pid();
             let cpu = process.cpu_usage();
             let mem = (process.memory() as f64 / system.total_memory() as f64) * 100.0;
+            // let pid: Pid = process.pid();
+            let stat_path = format!("/proc/{}/stat", pid);
+            let stat_content = fs::read_to_string(&stat_path).unwrap_or_default();
+            let parts: Vec<&str> = stat_content.split_whitespace().collect();
+            let pgrp  = parts.get(4).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+            let tpgid = parts.get(7).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+            let fg_bg = if pgrp == tpgid { "FG" } else { "BG" };
+            let fg_bg_color = if fg_bg == "FG" { fg_color } else { bg_color };
+            let pid_value = pid.as_u32() as u32; // Ensure correct type for getpriority
+            let prio = unsafe { getpriority(PRIO_PROCESS, pid_value) };
+            let priority = if prio == -1 {
+                // Check errno to determine if an error occurred
+                if nix::errno::errno() != 0 {
+                    "N/A".to_string() // Error occurred, return "N/A"
+                } else {
+                    "0".to_string() // Priority is actually 0
+                }
+            } else {
+                format!("{}", prio) // Valid priority
+            };
+
             
             // Check if this process is paused by our app
             let is_paused = process_controller.is_paused(&pid);
@@ -221,11 +304,13 @@ fn main() {
             
             // Print process entry with fixed-width columns to ensure alignment
             write!(stdout, 
-                "{:<6} {}{:<15}{} {}{:>6.1}{} {}{:>6.1}{} {}{:<10}{} {:<30}\r\n",
+                "{:<6}  {}{:<15}{}  {}{:>6.1}{}  {}{:>6.1}{}  {:<6}  {}{:<6}{}  {}{:<10}{}  {:<30}\r\n",
                 pid, 
                 user_color, username, reset,
                 cpu_color, cpu, reset,
                 mem_color, mem, reset,
+                priority,
+                fg_bg_color, fg_bg, reset,
                 state_color, state, reset,
                 command_display
             ).unwrap();
@@ -274,9 +359,12 @@ fn main() {
             InputMode::Restart => {
                 write!(stdout, "Enter PID to restart: {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
             },
+            InputMode::Priority => {
+                write!(stdout, "Set Priority (PID:PRIO): {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
+            },
             InputMode::Normal => {
                 // Updated key mappings in help text including restart
-                write!(stdout, "q:Quit | c:CPU | m:Mem | p:PID | s:Search | k:Kill | z:Pause/Resume | r:Restart").unwrap();
+                write!(stdout, "Q:Quit | C:CPU | M:Mem | P:PID | S:Search | K:Kill | Z:Pause/Resume | R:Restart | Y:Set Priority").unwrap();
             }
         }
         write!(stdout, "{}", reset).unwrap();
@@ -340,15 +428,10 @@ fn main() {
                         Key::Char('\n') => {
                             if !pid_input.is_empty() {
                                 if let Ok(pid_val) = pid_input.parse::<u32>() {
-                                    // Cast to usize when creating Pid (fixed from original code)
                                     let pid = Pid::from(pid_val as usize);
-                                    
-                                    // Check if process is already paused
                                     if process_controller.is_paused(&pid) {
-                                        // Process is paused, so resume it
                                         let _ = process_controller.control_process(pid, ProcessAction::Resume);
                                     } else {
-                                        // Process is not paused, so pause it
                                         let _ = process_controller.control_process(pid, ProcessAction::Pause);
                                     }
                                 }
@@ -374,21 +457,14 @@ fn main() {
                         Key::Char('\n') => {
                             if !pid_input.is_empty() {
                                 if let Ok(pid_val) = pid_input.parse::<u32>() {
-                                    // Create Pid from user input
                                     let pid = Pid::from(pid_val as usize);
-                                    
-                                    // Attempt to restart the process
                                     let result = process_restarter.restart_process(pid);
-                                    
-                                    // Set status message based on result
                                     status_message = match result {
                                         RestartResult::Success => format!("Process {} restart initiated", pid_val),
                                         RestartResult::KillFailed => format!("Failed to kill process {}", pid_val),
                                         RestartResult::NotFound => format!("Process {} not found", pid_val),
                                     };
-                                    
-                                    // Set timer to display message for a few cycles
-                                    status_timer = 6; // Display for 3 seconds (6 * 500ms)
+                                    status_timer = 6;
                                 }
                             }
                             input_mode = InputMode::Normal;
@@ -403,48 +479,80 @@ fn main() {
                         _ => {}
                     }
                 },
+                InputMode::Priority => {
+                    match key {
+                        Key::Esc => {
+                            input_mode = InputMode::Normal;
+                            pid_input.clear();
+                        },
+                        Key::Char('\n') => {
+                            if !pid_input.is_empty() {
+                                if let Some((pid_str, prio_str)) = pid_input.split_once(':') {
+                                    if let (Ok(pid), Ok(prio)) = (pid_str.parse::<i32>(), prio_str.parse::<i32>()) {
+                                        use termion::raw::RawTerminal;
+                                        use std::io::Stdout;
+
+                                        let raw_stdout = &mut stdout; // This is your RawTerminal<Stdout>
+                                        raw_stdout.suspend_raw_mode().unwrap();
+
+                                        // 👇 Prompt user and capture password in cooked mode
+                                        eprintln!("Raw mode suspended, about to prompt...");
+                                        let password = rpassword::prompt_password("Enter password: ").unwrap();
+                                        eprintln!("Password prompt done.");
+
+                                        raw_stdout.activate_raw_mode().unwrap();
+
+                                        // Optional: log the raw password input for debugging
+                                        eprintln!("DEBUG: password bytes: {:?}", password.as_bytes());
+                                        // eprintln!("You entered: {:?}", password);
+
+                                        if password.trim() == "admin123" {
+                                            // eprintln!("You entered: {:?}", password);
+                                            status_message = format!("Priority of {} set to {}", pid, prio);
+                                        } else {
+                                            status_message = "Incorrect password".to_string();
+                                        }
+
+                                        status_timer = 6;
+                                        input_mode = InputMode::Normal;
+                                        pid_input.clear();
+                                    }
+                                }
+                            }
+                        },
+                        Key::Char(c) => {
+                            pid_input.push(c);
+                        },
+                        Key::Backspace => {
+                            pid_input.pop();
+                        },
+                        _ => {}
+                    }
+                }
                 InputMode::Normal => {
                     match key {
-                        // Normal key mappings
-                        Key::Char('q') => quit = true,
-                        Key::Char('c') => sort_mode = SortMode::Cpu,
-                        Key::Char('m') => sort_mode = SortMode::Memory,
-                        Key::Char('p') => sort_mode = SortMode::Pid,
-                        Key::Char('s') => {
+                        Key::Char('Q') => quit = true,
+                        Key::Char('C') => sort_mode = SortMode::Cpu,
+                        Key::Char('M') => sort_mode = SortMode::Memory,
+                        Key::Char('P') => sort_mode = SortMode::Pid,
+                        Key::Char('S') => {
                             input_mode = InputMode::Search;
                             search_query.clear();
                         },
-                        Key::Char('k') => {
+                        Key::Char('K') => {
                             input_mode = InputMode::Kill;
                             pid_input.clear();
                         },
-                        Key::Char('z') => {
+                        Key::Char('Z') => {
                             input_mode = InputMode::Pause;
                             pid_input.clear();
                         },
-                        Key::Char('r') => {
+                        Key::Char('R') => {
                             input_mode = InputMode::Restart;
                             pid_input.clear();
                         },
-                        // Keep F-key mappings as well for backward compatibility
-                        Key::F(1) => quit = true,
-                        Key::F(2) => sort_mode = SortMode::Cpu,
-                        Key::F(3) => sort_mode = SortMode::Memory,
-                        Key::F(4) => sort_mode = SortMode::Pid,
-                        Key::F(5) => {
-                            input_mode = InputMode::Search;
-                            search_query.clear();
-                        },
-                        Key::F(9) => {
-                            input_mode = InputMode::Kill;
-                            pid_input.clear();
-                        },
-                        Key::F(10) => {
-                            input_mode = InputMode::Pause;
-                            pid_input.clear();
-                        },
-                        Key::F(11) => {
-                            input_mode = InputMode::Restart;
+                        Key::Char('Y') => {
+                            input_mode = InputMode::Priority;
                             pid_input.clear();
                         },
                         _ => {}
