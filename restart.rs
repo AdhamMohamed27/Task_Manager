@@ -1,8 +1,3 @@
-//Adham:
-//This restart implemntation can handle restarting VScode and any browser correctly
-//IN threary it can restart any process (not tested), but it cant handle restartting pulse itself 
-
-
 use std::process::{Command, Stdio};
 use sysinfo::{Pid, System};
 use std::{thread, time::Duration, fs, env};
@@ -13,6 +8,9 @@ pub enum RestartResult {
     KillFailed,
     NotFound,
     RestartFailed,
+    NotRunning,
+    NoExecutable,
+    Failed,
 }
 
 pub struct ProcessRestarter {
@@ -35,6 +33,12 @@ impl ProcessRestarter {
             Some(p) => p,
             None => return RestartResult::NotFound,
         };
+
+        if process.status().to_string() != "Run" {
+            return RestartResult::NotRunning;
+        }
+
+
         
         // Store process details before killing it
         let name = process.name().to_string();
