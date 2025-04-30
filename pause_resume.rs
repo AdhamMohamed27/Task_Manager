@@ -1,43 +1,70 @@
 use std::process::Command;
-use sysinfo::Pid;
+use sysinfo::{Pid, System};
+use std::fs;
 
-/// Enum to represent possible process control actions
+// Define actions that can be performed on processes
+#[derive(Clone)]
 pub enum ProcessAction {
     Pause,
     Resume,
 }
 
-/// Struct to track processes that have been paused by our application
 pub struct ProcessController {
     paused_processes: Vec<Pid>,
 }
 
 impl ProcessController {
-    /// Create a new ProcessController
     pub fn new() -> Self {
         ProcessController {
             paused_processes: Vec::new(),
         }
     }
 
-    /// Pause or resume a process using the SIGSTOP and SIGCONT signals
+    pub fn is_paused(&self, pid: &Pid) -> bool {
+        self.paused_processes.contains(pid)
+    }
+
+    pub fn get_paused_processes(&self) -> &Vec<Pid> {
+        &self.paused_processes
+    }
+
+    pub fn remove_terminated_process(&mut self, pid: &Pid) {
+        self.paused_processes.retain(|p| p != pid);
+    }
+
+    // Check if a process is a zombie
+    fn is_zombie(pid: Pid) -> bool {
+        let stat_path = format!("/proc/{}/stat", pid);
+        match fs::read_to_string(&stat_path) {
+            Ok(content) => {
+                let parts: Vec<&str> = content.split_whitespace().collect();
+                if let Some(state) = parts.get(2) {
+                    return *state == "Z";
+                }
+                false
+            },
+            Err(_) => false,
+        }
+    }
+
     pub fn control_process(&mut self, pid: Pid, action: ProcessAction) -> Result<(), String> {
+        if Self::is_zombie(pid) {
+            return Err(format!("Process {} is a zombie and cannot be paused or resumed.", pid));
+        }
+
         let signal = match action {
             ProcessAction::Pause => {
-                // Add to paused list if not already there
                 if !self.paused_processes.contains(&pid) {
                     self.paused_processes.push(pid);
                 }
                 "SIGSTOP"
             },
             ProcessAction::Resume => {
-                // Remove from paused list
                 self.paused_processes.retain(|&p| p != pid);
                 "SIGCONT"
-            }
+            },
         };
 
-        // Use kill command with appropriate signal
         let result = Command::new("kill")
             .arg(format!("-{}", signal))
             .arg(pid.to_string())
@@ -48,36 +75,71 @@ impl ProcessController {
                 if status.success() {
                     Ok(())
                 } else {
-                    Err(format!("Failed to {} process {}. Process might not exist or you may not have permission.", 
+                    // Rollback state change
+                    match action {
+                        ProcessAction::Pause => {
+                            self.paused_processes.retain(|&p| p != pid);
+                        },
+                        ProcessAction::Resume => {
+                            if !self.paused_processes.contains(&pid) {
+                                self.paused_processes.push(pid);
+                            }
+                        }
+                    }
+                    Err(format!(
+                        "Failed to {} process {}. Process might not exist or you may not have permission.",
                         match action {
                             ProcessAction::Pause => "pause",
                             ProcessAction::Resume => "resume",
-                        }, pid))
+                        },
+                        pid
+                    ))
                 }
             },
-            Err(e) => Err(format!("Error: {}", e)),
+            Err(e) => {
+                // Rollback state change
+                match action {
+                    ProcessAction::Pause => {
+                        self.paused_processes.retain(|&p| p != pid);
+                    },
+                    ProcessAction::Resume => {
+                        if !self.paused_processes.contains(&pid) {
+                            self.paused_processes.push(pid);
+                        }
+                    }
+                }
+                Err(format!("Error: {}", e))
+            },
         }
     }
 
-    /// Check if a process is paused by our application
-    pub fn is_paused(&self, pid: &Pid) -> bool {
-        self.paused_processes.contains(pid)
+    pub fn toggle_process(&mut self, pid: &Pid) -> Result<ProcessAction, String> {
+        if self.is_paused(pid) {
+            self.control_process(*pid, ProcessAction::Resume)?;
+            Ok(ProcessAction::Resume)
+        } else {
+            self.control_process(*pid, ProcessAction::Pause)?;
+            Ok(ProcessAction::Pause)
+        }
     }
 
-    /// Get all processes that are currently paused by our application
-    pub fn get_paused_processes(&self) -> Vec<Pid> {
-        // Return a copy of the paused processes to avoid borrow issues
-        self.paused_processes.clone()
-    }
-    
-    /// Resume all paused processes
     pub fn resume_all(&mut self) {
-        // Clone the list first to avoid borrow issues
         let paused_pids = self.paused_processes.clone();
-        
-        for pid in paused_pids {
-            // Ignore errors here, we're just trying our best to clean up
-            let _ = self.control_process(pid, ProcessAction::Resume);
+        let mut pids_to_remove = Vec::new();
+
+        for &pid in paused_pids.iter() {
+            match self.control_process(pid, ProcessAction::Resume) {
+                Ok(_) => {},
+                Err(e) => {
+                    if e.contains("might not exist") {
+                        pids_to_remove.push(pid);
+                    }
+                }
+            }
+        }
+
+        for pid in pids_to_remove {
+            self.remove_terminated_process(&pid);
         }
     }
 }
