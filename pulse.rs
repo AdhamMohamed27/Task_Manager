@@ -105,7 +105,9 @@ fn main() {
     let mut process_group_manager = ProcessGroupManager::new();
     
     // Clear screen and hide cursor
-    write!(stdout, "{}{}", clear::All, cursor::Hide).unwrap();
+    write!(stdout, "{}", cursor::Goto(1, 1)).unwrap(); // Only move cursor to top-left
+    write!(stdout, "{}{:width$}", cursor::Goto(1, 5), "", width = 80).unwrap(); // clear line
+
     stdout.flush().unwrap();
     
     // Setup Ctrl+C handler
@@ -340,6 +342,8 @@ fn main() {
                         state_color, state, reset,
                         command_display
                     ).unwrap();
+
+                    
                 }
                 
                 // Get a fresh copy of paused processes
@@ -578,31 +582,36 @@ fn main() {
         write!(stdout, "\r\n").unwrap();
         
         // Print system stats
-        let mem_percent = (system.used_memory() as f64 / system.total_memory() as f64) * 100.0;
-        let mem_color = if mem_percent > 80.0 {
-            high_usage_color
-        } else if mem_percent > 50.0 {
-            medium_usage_color
-        } else {
-            reset
-        };
-        
-        // Calculate total CPU usage
-        let total_cpu: f32 = system.processes().values().map(|p| p.cpu_usage()).sum();
-        let cpu_color = if total_cpu > 80.0 {
-            high_usage_color
-        } else if total_cpu > 50.0 {
-            medium_usage_color
-        } else {
-            reset
-        };
-        
-        write!(stdout, "{}System: {}{:.1}%{} CPU | {}{:.1}%{} Memory Used | {} Processes\r\n",
-            header_color,
-            cpu_color, total_cpu, reset,
-            mem_color, mem_percent, reset,
-            system.processes().len()
-        ).unwrap();
+        // Print system stats
+            let mem_percent = (system.used_memory() as f64 / system.total_memory() as f64) * 100.0;
+            let mem_color = if mem_percent > 80.0 {
+                high_usage_color
+            } else if mem_percent > 50.0 {
+                medium_usage_color
+            } else {
+                reset
+            };
+
+            let total_cpu: f32 = system.processes().values().map(|p| p.cpu_usage()).sum();
+            let cpu_per_core = total_cpu / system.cpus().len() as f32;
+            let cpu_color = if total_cpu > 80.0 {
+                high_usage_color
+            } else if total_cpu > 50.0 {
+                medium_usage_color
+            } else {
+                reset
+            };
+
+            // Now display per-core usage (you can also change this to `total_cpu` if you prefer)
+            write!(stdout, "{}System: {}{:.1}%{} CPU total | {}{:.1}%{} per core avg | {}{:.1}%{} Memory Used | {} Processes\r\n",
+                header_color,
+                cpu_color, total_cpu, reset,
+                cpu_color, cpu_per_core, reset,
+                mem_color, mem_percent, reset,
+                system.processes().len()
+            ).unwrap();
+
+
         
         // Display status message, if any
         if !status_message.is_empty() && status_timer > 0 {
