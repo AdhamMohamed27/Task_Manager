@@ -22,6 +22,7 @@ use process_groups::ProcessGroupManager;
 
 
 
+
 // Import the pause_resume module
 mod pause_resume;
 mod process_groups;
@@ -44,7 +45,7 @@ enum InputMode {
     Kill,
     Pause,  // New mode for pausing processes
     Restart,  // New mode for restarting processes
-    Priority,
+    Nice,
     Groups,
     Tree,
 }
@@ -110,6 +111,12 @@ fn main() {
     let visible_tree_height = 10; // or calculate from terminal height if needed
 
 
+    // Inside the process listing loop, when printing process information
+    // let nice = match priority::get_nice_value(pid.as_u32() as i32) {
+    //     Ok(nice_value) => format!("{:+}", nice_value),  // Displaying nice value with sign
+    //     Err(_) => String::from("N/A"),  // Handle errors (e.g., process not found)
+    // };
+
     // Clear screen and hide cursor
     write!(stdout, "{}{}", clear::All, cursor::Hide).unwrap();
     stdout.flush().unwrap();
@@ -126,6 +133,7 @@ fn main() {
         system.refresh_all();
         group_manager.force_update(&system); // or rely on internal interval logic
 
+    
         
         // Move cursor to top left and clear screen
         write!(stdout, "{}", clear::All).unwrap(); // Clear entire screen
@@ -158,7 +166,7 @@ fn main() {
         
         // Column headers with padding to ensure alignment
         write!(stdout, "{:<6}  {:<15}  {:>6}  {:>6}  {:<6}  {:<6}  {:<10}  {:<30}\r\n", 
-            "PID", "USER", "CPU%", "MEM%", "PRIO", "FG/BG", "STATE", "COMMAND"
+            "PID", "USER", "CPU%", "MEM%", "NICE", "FG/BG", "STATE", "COMMAND"
         ).unwrap();
     
         
@@ -245,7 +253,7 @@ fn main() {
         // Display processes
             for process in display_processes.iter().take(max_processes) {
                 let pid: Pid = process.pid();
-                let cpu = process.cpu_usage();
+                let cpu = process.cpu_usage() as f64 / system.physical_core_count().unwrap_or(1) as f64;
                 let mem = (process.memory() as f64 / system.total_memory() as f64) * 100.0;
                 // let pid: Pid = process.pid();
                 let stat_path = format!("/proc/{}/stat", pid);
@@ -259,12 +267,11 @@ fn main() {
                 //CHECK THIS PART
                 // right after you've read stat_content:
                 let parts: Vec<&str> = stat_content.split_whitespace().collect();
-                let nice = parts.get(18)
-                    .and_then(|s| s.parse::<i32>().ok())
-                    .unwrap_or(0);
-                let prio_str = format!("{:+}", nice);  // e.g. "+0", "-10", "+19"
-
-                
+                let pid = process.pid(); // Ensure pid is fetched from the process
+                let nice = match priority::get_nice_value(pid.as_u32() as i32) {  // Correct the pid here
+                    Ok(nice_value) => format!("{}", nice_value),  // Displaying nice value with sign
+                    Err(_) => String::from("0"),  // Handle errors (e.g., process not found)
+                };
                 // Check if this process is paused by our app
                 let is_paused = process_controller.is_paused(&pid);
                 
@@ -297,7 +304,7 @@ fn main() {
                 };
                 
                 // Color for CPU based on usage
-                let cpu_color = if cpu > 30.0 {
+                let cpu_color = if cpu > 15.0 {
                     high_usage_color
                 } else if cpu > 10.0 {
                     medium_usage_color
@@ -361,9 +368,7 @@ fn main() {
             separator_color, bold, num_cores, display_processes.len(), paused_count, reset
         ).unwrap();
 
-    
 
-        
         // Display status message if timer is active
         if status_timer > 0 {
             write!(stdout, " | {}{}{}", restart_color, status_message, reset).unwrap();
@@ -387,14 +392,14 @@ fn main() {
             InputMode::Restart => {
                 write!(stdout, "Enter PID to restart: {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
             },
-            InputMode::Priority => {
-                write!(stdout, "Set Priority (PID:PRIO): {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
+            InputMode::Nice => {
+                write!(stdout, "Set NICE (PID:): {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
             },
             InputMode::Groups =>{
                 write!(stdout, "Enter Group ID to pause/resume: {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
             }
             InputMode::Normal => {
-                write!(stdout, "Q:Quit | C:CPU | M:Mem | P:PID | S:Search | K:Kill | Z:Pause | R:Restart | Y:Priority | G:Group Pause | T:Show Tree").unwrap();
+                write!(stdout, "Q:Quit | C:CPU | M:Mem | P:PID | S:Search | K:Kill | Z:Pause | R:Restart | N:Nice | G:Group Pause | T:Show Tree").unwrap();
             },
             InputMode::Tree => {
                 write!(stdout, "Press Enter to select a process | Up/Down to navigate | Esc to exit").unwrap();
@@ -582,7 +587,8 @@ fn main() {
                         _ => {}
                     }
                 },
-                InputMode::Priority => {
+                // When the user enters the Nice input mode
+                InputMode::Nice => {
                     match key {
                         Key::Esc => {
                             input_mode = InputMode::Normal;
@@ -590,33 +596,19 @@ fn main() {
                         },
                         Key::Char('\n') => {
                             if let Some((p_str, n_str)) = pid_input.split_once(':') {
-                                if let (Ok(pid), Ok(prio)) = (p_str.parse::<i32>(), n_str.parse::<i32>()) {
-                                    // 1) Suspend raw mode so prompt_password() works
-                                    stdout.suspend_raw_mode().unwrap();
-                
-                                    // 2) Prompt for (masked) password
-                                    let password = rpassword::prompt_password("Enter admin password: ")
-                                        .unwrap_or_default();
-                
-                                    // 3) Re-activate raw mode
-                                    stdout.activate_raw_mode().unwrap();
-                
-                                    // 4) Now verify and set
-                                    if password.trim() == "admin123" {
-                                        match priority::set_priority(pid, prio) {
-                                            Ok(msg)  => status_message = msg,
-                                            Err(e)   => status_message = format!("Error: {}", e),
-                                        }
-                                    } else {
-                                        status_message = "Incorrect password".into();
+                                if let (Ok(pid), Ok(nice)) = (p_str.parse::<i32>(), n_str.parse::<i32>()) {
+                                    // Adjust the nice value without sudo
+                                    match priority::set_priority(pid, nice) {
+                                        Ok(msg)  => status_message = msg,
+                                        Err(e)   => status_message = format!("Error: {}", e),
                                     }
                                     status_timer = 6;
                                 } else {
-                                    status_message = "Invalid PID:PRIO format".into();
+                                    status_message = "Invalid PID:NICE format".into();
                                     status_timer = 6;
                                 }
                             } else {
-                                status_message = "Format must be PID:PRIO".into();
+                                status_message = "Format must be PID:NICE".into();
                                 status_timer = 6;
                             }
                 
@@ -656,8 +648,8 @@ fn main() {
                             input_mode = InputMode::Restart;
                             pid_input.clear();
                         },
-                        Key::Char('Y') => {
-                            input_mode = InputMode::Priority;
+                        Key::Char('N') => {
+                            input_mode = InputMode::Nice;
                             pid_input.clear();
                         },
                         Key::Char('G') => {
