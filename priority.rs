@@ -1,16 +1,33 @@
-use std::process::Command;
+use libc::{getpriority, PRIO_PROCESS};
+use nix::errno::Errno;
+use libc::setpriority;
 
-pub fn set_priority(pid: i32, prio: i32) -> Result<String, String> {
-    let output = Command::new("renice")
-        .arg(prio.to_string())
-        .arg("-p")
-        .arg(pid.to_string())
-        .output()
-        .map_err(|e| format!("Failed to run renice: {}", e))?;
-
-    if output.status.success() {
-        Ok(format!("Priority set to {} for PID {}", prio, pid))
+/// Change this process’s nice value.  
+/// Returns Ok(msg) on success or Err(errmsg) on failure.
+pub fn set_priority(pid: i32, nice: i32) -> Result<String, String> {
+    // SAFETY: setpriority is a simple libc call
+    let ret = unsafe { setpriority(PRIO_PROCESS, pid as u32, nice) };
+    if ret < 0 {
+        let e = Errno::last();
+        Err(format!("{} (errno {})", e.desc(), e as i32))
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
+        Ok(format!("Nice set to {:+} for PID {}", nice, pid))
     }
 }
+
+pub fn get_nice_value(pid: i32) -> Result<i32, String> {
+    // SAFETY: getpriority is a simple libc call
+    let ret = unsafe { getpriority(PRIO_PROCESS, pid as u32) };
+    if ret < 0 {
+        let e = Errno::last();
+        Err(format!("{} (errno {})", e.desc(), e as i32))
+    } else {
+        Ok(ret)
+    }
+}
+
+
+// Layer	Numeric Range	Highest Priority	Lowest Priority
+// Nice (NI)	-20 to +19	-20 (most CPU share)	+19 (least CPU share)
+// Kernel PR (normal)	100-139	100 (when NI=-20)	139 (when NI=+19)
+// Kernel PR (real-time)	0-99	0 (highest RT)	99 (lowest RT)
