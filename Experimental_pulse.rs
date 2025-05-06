@@ -1,5 +1,5 @@
 use std::{thread, time::Duration};
-use std::io::{stdout, Write};
+use std::io::{stdout,Write};
 use std::process::Command;
 use sysinfo::{System, Process, ProcessStatus, Pid};
 use users::get_user_by_uid;
@@ -20,6 +20,13 @@ use termion::raw::{IntoRawMode, RawTerminal};
 use process_groups::ProcessGroupManager;
 mod csv_export;
 mod json_export;
+use std::fmt::Write as FmtWrite;
+use std::io::Write as IoWrite;
+mod help;
+use help::get_help_text;
+
+
+
 
 use csv_export::CsvExporter;
 use json_export::JsonExporter;
@@ -55,13 +62,14 @@ enum InputMode {
     Tree,
     Export,
     JExport,
+    Help,
 }
 
 // fn prompt_password() -> String {
 //     // Use rpassword which handles all the terminal mode complexity
 //     match rpassword::prompt_password("Enter admin password: ") {
 //         Ok(password) => password,
-//         Err(_) => {
+//         Err(_) => {()
 //             eprintln!("Failed to read password");
 //             String::new() // Return empty string on error
 //         }
@@ -69,6 +77,8 @@ enum InputMode {
 // }
 
 fn main() {
+
+    let mut buffer = String::new();
     // Set up terminal for raw mode
     let mut stdout = stdout().into_raw_mode().unwrap();
     let mut system = System::new_all();
@@ -94,7 +104,6 @@ fn main() {
     let bg_color = "\x1B[38;5;39m";  // bright light blue for BG
     
 
-    
     // Application state
     let mut sort_mode = SortMode::Cpu;
     let mut input_mode = InputMode::Normal;
@@ -125,8 +134,8 @@ fn main() {
     // };
 
     // Clear screen and hide cursor
-    write!(stdout, "{}{}", clear::All, cursor::Hide).unwrap();
-    stdout.flush().unwrap();
+    write!(buffer, "{}{}", clear::All, cursor::Hide).unwrap();
+    IoWrite::flush(&mut stdout).unwrap();
     
     // Setup Ctrl+C handler
     let running = Arc::new(AtomicBool::new(true));
@@ -134,6 +143,24 @@ fn main() {
     
     // Create input iterator ONCE for the main loop
     let mut input = termion::async_stdin().keys();
+
+    let help_screen = get_help_text();
+    write!(buffer, "{}{}", clear::All, cursor::Goto(1, 1)).unwrap();
+    write!(buffer, "{}\r\n", help_screen).unwrap();
+    stdout.write_all(buffer.as_bytes()).unwrap();
+    stdout.flush().unwrap();
+    buffer.clear();
+
+    // Wait for ESC before entering Pulse
+    loop {
+        if let Some(Ok(key)) = input.next() {
+            if key == Key::Esc {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
     
     while !quit && running.load(Ordering::Relaxed) {
         // Always refresh system data at the beginning of each loop
@@ -143,47 +170,48 @@ fn main() {
     
         
         // Move cursor to top left and clear screen
-        write!(stdout, "{}", clear::All).unwrap(); // Clear entire screen
-        write!(stdout, "{}", cursor::Goto(1, 1)).unwrap();
+        write!(buffer, "{}", clear::All).unwrap(); // Clear entire screen
+        write!(buffer, "{}", cursor::Goto(1, 1)).unwrap();
         
         // Get terminal size
         let (width, height) = termion::terminal_size().unwrap_or((80, 24));
 
         if input_mode == InputMode::Tree {
-            write!(stdout, "{}{}", clear::All, cursor::Goto(1, 1)).unwrap(); // FULL clear
-            write!(stdout, "{}{}Process Tree (↑/↓, Enter, Esc){}\r\n\r\n", bold, header_color, reset).unwrap();
+            use std::fmt::Write as FmtWrite; // needed to use write! on String
+            write!(buffer, "{}{}", clear::All, cursor::Goto(1, 1)).unwrap();
+                        write!(buffer, "{}{}Process Tree (↑/↓, Enter, Esc){}\r\n\r\n", bold, header_color, reset).unwrap();
 
             for (i, line) in tree_output_lines.iter().enumerate().skip(tree_scroll).take(visible_tree_height) {
                 if i == selected_index {
-                    write!(stdout, "\x1B[7m{}\x1B[0m\r\n", line).unwrap(); // highlighted line
+                    write!(buffer, "\x1B[7m{}\x1B[0m\r\n", line).unwrap(); // highlighted line
                 } else {
-                    write!(stdout, "{}\r\n", line).unwrap();
+                    write!(buffer, "{}\r\n", line).unwrap();
                 }
             }
         }
         
         
         // Print the title with styling
-        write!(stdout, "{}{}Pulse - Linux Process Monitor{}\r\n\r\n", title_color, bold, reset).unwrap();
+        write!(buffer, "{}{}Pulse - Linux Process Monitor{}\r\n\r\n", title_color, bold, reset).unwrap();
         
         // Print the header with styled columns (fixed width to ensure alignment)
-        write!(stdout, "{}{}",
+        write!(buffer, "{}{}",
             header_color, bold
         ).unwrap();
         
         // Column headers with padding to ensure alignment
-        write!(stdout, "{:<6}  {:<15}  {:>6}  {:>6}  {:<6}  {:<6}  {:<10}  {:<30}\r\n", 
+        write!(buffer, "{:<6}  {:<15}  {:>6}  {:>6}  {:<6}  {:<6}  {:<10}  {:<30}\r\n", 
             "PID", "USER", "CPU%", "MEM%", "NICE", "FG/BG", "STATE", "COMMAND"
         ).unwrap();
     
         
         // Separator line
-        write!(stdout, "{}{}\r\n", 
+        write!(buffer, "{}{}\r\n", 
             separator_color,
             "─".repeat(width as usize)
         ).unwrap();
         
-        write!(stdout, "{}", reset).unwrap();
+        write!(buffer, "{}", reset).unwrap();
         
         // Process list - collect as references to avoid ownership issues
         let mut processes: Vec<_> = system.processes().values().collect();
@@ -343,7 +371,7 @@ fn main() {
                 };
                 
                 // Print process entry with fixed-width columns to ensure alignment
-                write!(stdout, 
+                write!(buffer, 
                     "{:<6}  {}{:<15}{}  {}{:>6.1}{}  {}{:>6.1}{}  {:<6}  {}{:<6}{}  {}{:<10}{}  {:<30}\r\n",
                     pid, 
                     user_color, username, reset,
@@ -364,63 +392,66 @@ fn main() {
         
         // Move to bottom of screen for stats
         let stats_line = height - 3;
-        write!(stdout, "{}\r\n", cursor::Goto(1, stats_line)).unwrap();
+        write!(buffer, "{}\r\n", cursor::Goto(1, stats_line)).unwrap();
         
         // Print memory and CPU info
-        write!(stdout, "{}{}Memory: {:.1}GB / {:.1}GB ({:.1}%){}\r\n", 
+        write!(buffer, "{}{}Memory: {:.1}GB / {:.1}GB ({:.1}%){}\r\n", 
             separator_color, bold, mem_used_gb, mem_gb, mem_percent, reset
         ).unwrap();
         
         let num_cores = system.physical_core_count().unwrap_or(1);
         let paused_count = process_controller.get_paused_processes().len();
-        write!(stdout, "{}{}CPUs: {} cores, Processes: {}, Paused: {}{}", 
+        write!(buffer, "{}{}CPUs: {} cores, Processes: {}, Paused: {}{}", 
             separator_color, bold, num_cores, display_processes.len(), paused_count, reset
         ).unwrap();
 
 
         // Display status message if timer is active
         if status_timer > 0 {
-            write!(stdout, " | {}{}{}", restart_color, status_message, reset).unwrap();
+            write!(buffer, " | {}{}{}", restart_color, status_message, reset).unwrap();
             status_timer -= 1;
         }
         
-        write!(stdout, "\r\n").unwrap();
+        write!(buffer, "\r\n").unwrap();
         
         // Help line at bottom
-        write!(stdout, "{}{}", help_color, bold).unwrap();
+        write!(buffer, "{}{}", help_color, bold).unwrap();
         match input_mode {
             InputMode::Search => {
-                write!(stdout, "Search PID: {} | Enter when Done | Esc to cancel", search_query).unwrap();
+                write!(buffer, "Search PID: {} | Enter when Done | Esc to cancel", search_query).unwrap();
             },
             InputMode::Kill => {
-                write!(stdout, "Kill PID: {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
+                write!(buffer, "Kill PID: {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
             },
             InputMode::Pause => {
-                write!(stdout, "Enter PID to pause/resume: {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
+                write!(buffer, "Enter PID to pause/resume: {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
             },
             InputMode::Restart => {
-                write!(stdout, "Enter PID to restart: {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
+                write!(buffer, "Enter PID to restart: {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
             },
             InputMode::Nice => {
-                write!(stdout, "Set NICE (PID:): {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
+                write!(buffer, "Set NICE (PID:): {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
             },
             InputMode::Groups =>{
-                write!(stdout, "Enter Group ID to pause/resume: {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
+                write!(buffer , "Enter Group ID to pause/resume: {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
             }
             InputMode::Normal => {
-                write!(stdout, "Q:Quit | C:CPU | M:Mem | P:PID | S:Search | K:Kill | Z:Pause | R:Restart | N:Nice | G:Group Pause | T:Show Tree | J: Export as Json file | E: Export as CSV file").unwrap();
+                write!(buffer, "Q:Quit | C:CPU | M:Mem | P:PID | S:Search | K:Kill | Z:Pause | R:Restart | N:Nice | G:Group Pause | T:Show Tree | J: Export as Json file | E: Export as CSV file | H:Help").unwrap();
             },
             InputMode::Tree => {
-                write!(stdout, "Press Enter to select a process | Up/Down to navigate | Esc to exit").unwrap();
+                write!(buffer , "Press Enter to select a process | Up/Down to navigate | Esc to exit").unwrap();
             },
             InputMode::Export => {
-                write!(stdout, "Export to CSV: {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
+                write!(buffer , "Export to CSV: {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
             },
             InputMode::JExport => {
-                write!(stdout, "Export to JSON: {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
-            },   
+                write!(buffer , "Export to JSON: {} | Enter to confirm | Esc to cancel", pid_input).unwrap();
+            },  
+            InputMode::Help => {
+                write!(buffer , "Press Enter to view help | Esc to cancel").unwrap();
+            }, 
         }
-        write!(stdout, "{}", reset).unwrap();
+        write!(buffer, "{}", reset).unwrap();
         
         // Make sure to flush stdout to display updates
         stdout.flush().unwrap();
@@ -497,6 +528,21 @@ fn main() {
                         },
                         Key::Backspace => {
                             pid_input.pop();
+                        },
+                        _ => {}
+                    }
+                },
+                InputMode::Help => {
+                    match key {
+                        Key::Esc => {
+                            input_mode = InputMode::Normal;
+                            pid_input.clear();
+                        },
+                        Key::Char('\n') => {
+                            let help_text = get_help_text();
+                            write!(buffer, "{}{}", clear::All, cursor::Goto(1, 1)).unwrap();
+                            write!(buffer, "{}{}{}\r\n\r\n", help_color, bold, help_text).unwrap();
+                            input_mode = InputMode::Normal;
                         },
                         _ => {}
                     }
@@ -754,7 +800,25 @@ fn main() {
                                     status_timer = 6;
                                 }
                             }
-                        },                        
+                        },
+                        Key::Char('H') => {
+                            let help_screen = get_help_text();
+                            write!(buffer, "{}{}", clear::All, cursor::Goto(1, 1)).unwrap();
+                            write!(buffer, "{}", help_screen).unwrap();
+                            stdout.write_all(buffer.as_bytes()).unwrap();
+                            stdout.flush().unwrap();
+                            buffer.clear();
+                        
+                            // Wait for key press to continue
+                            loop {
+                                if let Some(Ok(key)) = input.next() {
+                                    if key == Key::Esc || key == Key::Char('h') {
+                                        break;
+                                    }
+                                }
+                                thread::sleep(Duration::from_millis(100));
+                            }
+                        },                                                
                         
                         Key::Char('J') => {
                             let filename = JsonExporter::get_default_filename();
@@ -788,12 +852,25 @@ fn main() {
             thread::sleep(Duration::from_millis(10)); // fast, responsive nav in tree mode
         }
          // Even shorter for better responsiveness
+
+         // Flush the buffer to the terminal
+        stdout.write_all(buffer.as_bytes()).unwrap();
+        stdout.flush().unwrap();
+        buffer.clear();
+
+        // Responsive sleep
+        if input_mode != InputMode::Tree {
+            thread::sleep(Duration::from_millis(500));
+        } else {
+            thread::sleep(Duration::from_millis(10));
+        }
+
     }
     // Use the resume_all method to resume all paused processes before exiting
     process_controller.resume_all();
     
     // Clean up terminal
-    write!(stdout, "{}{}", cursor::Show, clear::All).unwrap();
+    write!(buffer, "{}{}", cursor::Show, clear::All).unwrap();
     stdout.flush().unwrap();
 
     fn extract_pid_from_line(line: &str) -> Option<u32> {
@@ -806,4 +883,5 @@ fn main() {
         }
         None
     }
+
 }
